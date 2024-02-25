@@ -1,46 +1,36 @@
-name: test-cygwin
+name: test-alpine
 
 on: [push, pull_request, workflow_dispatch]
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
-    strategy:
-      fail-fast: false
-
-    env:
-      CHERE_INVOKING: "1"
-      CYGWIN_NOWINPATH: "1"
+    container:
+      image: alpine:latest
 
     defaults:
       run:
-        shell: C:\tools\cygwin\bin\bash.exe --login --norc -eo pipefail -o igncr "{0}"
+        shell: sudo -u runner sh -exo pipefail {0}
 
     steps:
-    - name: Force LF line endings
+    - name: Prepare Alpine Linux
       run: |
-        git config --global core.autocrlf false  # Affects the non-Cygwin git.
-      shell: bash  # Use Git Bash instead of Cygwin Bash for this step.
+        apk add sudo git git-daemon python3 py3-pip
+        echo 'Defaults env_keep += "CI GITHUB_* RUNNER_*"' >/etc/sudoers.d/ci_env
+        addgroup -g 127 docker
+        adduser -D -u 1001 runner
+        adduser runner docker
+      shell: sh -exo pipefail {0}  # Run this as root, not the "runner" user.
 
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
-    - name: Set up Cygwin
-      uses: egor-tensin/setup-cygwin@v4
-      with:
-        packages: python39=3.9.16-1 python39-pip python39-virtualenv git
-
-    - name: Arrange for verbose output
+    - name: Set workspace ownership
       run: |
-        # Arrange for verbose output but without shell environment setup details.
-        echo 'set -x' >~/.bash_profile
-
-    - name: Special configuration for Cygwin git
-      run: |
-        git config --global --add safe.directory "$(pwd)"
-        git config --global core.autocrlf false
+        chown -R runner:docker -- "$GITHUB_WORKSPACE"
+      shell: sh -exo pipefail {0}  # Run this as root, not the "runner" user.
 
     - name: Prepare this repo for tests
       run: |
@@ -54,10 +44,11 @@ jobs:
         # and cause subsequent tests to fail
         cat test/fixtures/.gitconfig >> ~/.gitconfig
 
-    - name: Ensure the "pip" command is available
+    - name: Set up virtualenv
       run: |
-        # This is used unless, and before, an updated pip is installed.
-        ln -s pip3 /usr/bin/pip
+        python -m venv .venv
+        . .venv/bin/activate
+        printf '%s=%s\n' 'PATH' "$PATH" 'VIRTUAL_ENV' "$VIRTUAL_ENV" >>"$GITHUB_ENV"
 
     - name: Update PyPA packages
       run: |

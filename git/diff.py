@@ -4,6 +4,7 @@
 # 3-Clause BSD License: https://opensource.org/license/bsd-3-clause/
 
 import re
+
 from git.cmd import handle_process_output
 from git.compat import defenc
 from git.util import finalize_process, hex_to_bin
@@ -49,8 +50,8 @@ Lit_change_type = Literal["A", "D", "C", "M", "R", "T", "U"]
 
 __all__ = ("Diffable", "DiffIndex", "Diff", "NULL_TREE")
 
-# Special object to compare against the empty tree in diffs.
 NULL_TREE = object()
+"""Special object to compare against the empty tree in diffs."""
 
 _octal_byte_re = re.compile(rb"\\([0-9]{3})")
 
@@ -208,13 +209,15 @@ class DiffIndex(List[T_Diff]):
     The class improves the diff handling convenience.
     """
 
-    # Change type invariant identifying possible ways a blob can have changed:
-    # A = Added
-    # D = Deleted
-    # R = Renamed
-    # M = Modified
-    # T = Changed in the type
     change_type = ("A", "C", "D", "R", "M", "T")
+    """Change type invariant identifying possible ways a blob can have changed:
+
+    * ``A`` = Added
+    * ``D`` = Deleted
+    * ``R`` = Renamed
+    * ``M`` = Modified
+    * ``T`` = Changed in the type
+    """
 
     def iter_change_type(self, change_type: Lit_change_type) -> Iterator[T_Diff]:
         """

@@ -142,9 +142,11 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
 
     __slots__ = ("repo", "version", "entries", "_extension_data", "_file_path")
 
-    _VERSION = 2  # Latest version we support.
+    _VERSION = 2
+    """The latest version we support."""
 
-    S_IFGITLINK = S_IFGITLINK  # A submodule.
+    S_IFGITLINK = S_IFGITLINK
+    """Flags for a submodule."""
 
     def __init__(self, repo: "Repo", file_path: Union[PathLike, None] = None) -> None:
         """Initialize this Index instance, optionally from the given ``file_path``.
@@ -379,23 +381,21 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             arg_list.append("--aggressive")
         # END merge handling
 
-        # tmp file created in git home directory to be sure renaming
-        # works - /tmp/ dirs could be on another device.
-        with contextlib.ExitStack() as stack:
-            tmp_index = stack.enter_context(_named_temporary_file_for_subprocess(repo.git_dir))
+        # Create the temporary file in the .git directory to be sure renaming
+        # works - /tmp/ directories could be on another device.
+        with _named_temporary_file_for_subprocess(repo.git_dir) as tmp_index:
             arg_list.append("--index-output=%s" % tmp_index)
             arg_list.extend(treeish)
 
-            # Move current index out of the way - otherwise the merge may fail
+            # Move the current index out of the way - otherwise the merge may fail
             # as it considers existing entries. Moving it essentially clears the index.
             # Unfortunately there is no 'soft' way to do it.
             # The TemporaryFileSwap ensures the original file gets put back.
-
-            stack.enter_context(TemporaryFileSwap(join_path_native(repo.git_dir, "index")))
-            repo.git.read_tree(*arg_list, **kwargs)
-            index = cls(repo, tmp_index)
-            index.entries  # Force it to read the file as we will delete the temp-file.
-            return index
+            with TemporaryFileSwap(join_path_native(repo.git_dir, "index")):
+                repo.git.read_tree(*arg_list, **kwargs)
+                index = cls(repo, tmp_index)
+                index.entries  # Force it to read the file as we will delete the temp-file.
+                return index
             # END index merge handling
 
     # UTILITIES
@@ -940,7 +940,7 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
         for item in items:
             if isinstance(item, (BaseIndexEntry, (Blob, Submodule))):
                 paths.append(self._to_relative_path(item.path))
-            elif isinstance(item, str):
+            elif isinstance(item, (str, os.PathLike)):
                 paths.append(self._to_relative_path(item))
             else:
                 raise TypeError("Invalid item type: %r" % item)

@@ -17,6 +17,8 @@ probably the skills to scratch that itch of mine: implement `git` in a way that 
 If you like the idea and want to learn more, please head over to [gitoxide](https://github.com/Byron/gitoxide), an
 implementation of 'git' in [Rust](https://www.rust-lang.org).
 
+*(Please note that `gitoxide` is not currently available for use in Python, and that Rust is required)*
+
 ## GitPython
 
 GitPython is a python library used to interact with git repositories, high-level like git-porcelain,
@@ -219,57 +221,6 @@ Please have a look at the [contributions file][contributing].
 5. _Optionally_ create and activate a [virtual environment](https://packaging.python.org/en/latest/guides/installing-using-pip-and-virtual-environments/#creating-a-virtual-environment). (Then the next step can install `build` and `twine`.)
 6. Run `make release`.
 7. Go to [GitHub Releases](https://github.com/gitpython-developers/GitPython/releases) and publish a new one with the recently pushed tag. Generate the changelog.
-
-### How to verify a release (DEPRECATED)
-
-Note that what follows is deprecated and future releases won't be signed anymore.
-More details about how it came to that can be found [in this issue](https://github.com/gitpython-developers/gitdb/issues/77).
-
-----
-
-Please only use releases from `pypi` as you can verify the respective source
-tarballs.
-
-This script shows how to verify the tarball was indeed created by the authors of
-this project:
-
-```bash
-curl https://files.pythonhosted.org/packages/09/bc/ae32e07e89cc25b9e5c793d19a1e5454d30a8e37d95040991160f942519e/GitPython-3.1.8-py3-none-any.whl > gitpython.whl
-curl https://files.pythonhosted.org/packages/09/bc/ae32e07e89cc25b9e5c793d19a1e5454d30a8e37d95040991160f942519e/GitPython-3.1.8-py3-none-any.whl.asc >  gitpython-signature.asc
-gpg --verify gitpython-signature.asc gitpython.whl
-```
-
-which outputs
-
-```bash
-gpg: Signature made Fr  4 Sep 10:04:50 2020 CST
-gpg:                using RSA key 27C50E7F590947D7273A741E85194C08421980C9
-gpg: Good signature from "Sebastian Thiel (YubiKey USB-C) <byronimo@gmail.com>" [ultimate]
-gpg:                 aka "Sebastian Thiel (In Rust I trust) <sebastian.thiel@icloud.com>" [ultimate]
-```
-
-You can verify that the keyid indeed matches the release-signature key provided in this
-repository by looking at the keys details:
-
-```bash
-gpg --list-packets ./release-verification-key.asc
-```
-
-You can verify that the commit adding it was also signed by it using:
-
-```bash
-git show --show-signature  ./release-verification-key.asc
-```
-
-If you would like to trust it permanently, you can import and sign it:
-
-```bash
-gpg --import ./release-verification-key.asc
-gpg --edit-key 4C08421980C9
-
-> sign
-> save
-```
 
 ### Projects using GitPython
 

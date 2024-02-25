@@ -60,17 +60,16 @@ else:
 
 __all__ = ("GitConfigParser", "SectionConstraint")
 
+_logger = logging.getLogger(__name__)
 
-log = logging.getLogger("git.config")
-log.addHandler(logging.NullHandler())
-
-
-# The configuration level of a configuration file.
 CONFIG_LEVELS: ConfigLevels_Tup = ("system", "user", "global", "repository")
+"""The configuration level of a configuration file."""
 
-# Section pattern to detect conditional includes.
-# https://git-scm.com/docs/git-config#_conditional_includes
 CONDITIONAL_INCLUDE_REGEXP = re.compile(r"(?<=includeIf )\"(gitdir|gitdir/i|onbranch):(.+)\"")
+"""Section pattern to detect conditional includes.
+
+See: https://git-scm.com/docs/git-config#_conditional_includes
+"""
 
 
 class MetaParserBuilder(abc.ABCMeta):  # noqa: B024
@@ -283,12 +282,14 @@ class GitConfigParser(cp.RawConfigParser, metaclass=MetaParserBuilder):
     """
 
     # { Configuration
-    # The lock type determines the type of lock to use in new configuration readers.
-    # They must be compatible to the LockFile interface.
-    # A suitable alternative would be the BlockingLockFile
     t_lock = LockFile
-    re_comment = re.compile(r"^\s*[#;]")
+    """The lock type determines the type of lock to use in new configuration readers.
 
+    They must be compatible to the LockFile interface.
+    A suitable alternative would be the :class:`~git.util.BlockingLockFile`.
+    """
+
+    re_comment = re.compile(r"^\s*[#;]")
     # } END configuration
 
     optvalueonly_source = r"\s*(?P<option>[^:=\s][^:=]*)"
@@ -299,8 +300,8 @@ class GitConfigParser(cp.RawConfigParser, metaclass=MetaParserBuilder):
 
     del optvalueonly_source
 
-    # list of RawConfigParser methods able to change the instance
     _mutating_methods_ = ("add_section", "remove_section", "remove_option", "set")
+    """List of RawConfigParser methods able to change the instance."""
 
     def __init__(
         self,
@@ -408,7 +409,7 @@ class GitConfigParser(cp.RawConfigParser, metaclass=MetaParserBuilder):
         try:
             self.write()
         except IOError:
-            log.error("Exception during destruction of GitConfigParser", exc_info=True)
+            _logger.error("Exception during destruction of GitConfigParser", exc_info=True)
         except ReferenceError:
             # This happens in Python 3... and usually means that some state cannot be
             # written as the sections dict cannot be iterated. This usually happens when
@@ -708,7 +709,7 @@ class GitConfigParser(cp.RawConfigParser, metaclass=MetaParserBuilder):
         # END assert multiple files
 
         if self._has_includes():
-            log.debug(
+            _logger.debug(
                 "Skipping write-back of configuration file as include files were merged in."
                 + "Set merge_includes=False to prevent this."
             )

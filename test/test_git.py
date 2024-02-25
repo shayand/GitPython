@@ -3,16 +3,19 @@
 # This module is part of GitPython and is released under the
 # 3-Clause BSD License: https://opensource.org/license/bsd-3-clause/
 
+import contextlib
 import gc
 import inspect
 import logging
 import os
 import os.path as osp
+from pathlib import Path
+import pickle
 import re
 import shutil
 import subprocess
 import sys
-from tempfile import TemporaryDirectory, TemporaryFile
+import tempfile
 from unittest import skipUnless
 
 if sys.version_info >= (3, 8):
@@ -25,6 +28,70 @@ import ddt
 from git import Git, refresh, GitCommandError, GitCommandNotFound, Repo, cmd
 from git.util import cwd, finalize_process
 from test.lib import TestBase, fixture_path, with_rw_directory
+
+
+@contextlib.contextmanager
+def _patch_out_env(name):
+    try:
+        old_value = os.environ[name]
+    except KeyError:
+        old_value = None
+    else:
+        del os.environ[name]
+    try:
+        yield
+    finally:
+        if old_value is not None:
+            os.environ[name] = old_value
+
+
+@contextlib.contextmanager
+def _rollback_refresh():
+    old_git_executable = Git.GIT_PYTHON_GIT_EXECUTABLE
+
+    if old_git_executable is None:
+        raise RuntimeError("no executable string (need initial refresh before test)")
+
+    try:
+        yield old_git_executable  # Provide the old value for convenience.
+    finally:
+        # The cleanup refresh should always raise an exception if it fails, since if it
+        # fails then previously discovered test results could be misleading and, more
+        # importantly, subsequent tests may be unable to run or give misleading results.
+        # So pre-set a non-None value, so that the cleanup will be a "second" refresh.
+        # This covers cases where a test has set it to None to test a "first" refresh.
+        Git.GIT_PYTHON_GIT_EXECUTABLE = Git.git_exec_name
+
+        # Do the cleanup refresh. This sets Git.GIT_PYTHON_GIT_EXECUTABLE to old_value
+        # in most cases. The reason to call it is to achieve other associated state
+        # changes as well, which include updating attributes of the FetchInfo class.
+        refresh()
+
+
+@contextlib.contextmanager
+def _fake_git(*version_info):
+    fake_version = ".".join(map(str, version_info))
+    fake_output = f"git version {fake_version} (fake)"
+
+    with tempfile.TemporaryDirectory() as tdir:
+        if os.name == "nt":
+            fake_git = Path(tdir, "fake-git.cmd")
+            script = f"@echo {fake_output}\n"
+            fake_git.write_text(script, encoding="utf-8")
+        else:
+            fake_git = Path(tdir, "fake-git")
+            script = f"#!/bin/sh\necho '{fake_output}'\n"
+            fake_git.write_text(script, encoding="utf-8")
+            fake_git.chmod(0o755)
+
+        yield str(fake_git.absolute())
+
+
+def _rename_with_stem(path, new_stem):
+    if sys.version_info >= (3, 9):
+        path.rename(path.with_stem(new_stem))
+    else:
+        path.rename(path.with_name(new_stem + path.suffix))
 
 
 @ddt.ddt
@@ -97,29 +164,28 @@ class TestGit(TestBase):
 
     def _do_shell_combo(self, value_in_call, value_from_class):
         with mock.patch.object(Git, "USE_SHELL", value_from_class):
-            # git.cmd gets Popen via a "from" import, so patch it there.
-            with mock.patch.object(cmd, "Popen", wraps=cmd.Popen) as mock_popen:
+            with mock.patch.object(cmd, "safer_popen", wraps=cmd.safer_popen) as mock_safer_popen:
                 # Use a command with no arguments (besides the program name), so it runs
                 # with or without a shell, on all OSes, with the same effect.
                 self.git.execute(["git"], with_exceptions=False, shell=value_in_call)
 
-        return mock_popen
+        return mock_safer_popen
 
     @ddt.idata(_shell_cases)
     def test_it_uses_shell_or_not_as_specified(self, case):
         """A bool passed as ``shell=`` takes precedence over `Git.USE_SHELL`."""
         value_in_call, value_from_class, expected_popen_arg = case
-        mock_popen = self._do_shell_combo(value_in_call, value_from_class)
-        mock_popen.assert_called_once()
-        self.assertIs(mock_popen.call_args.kwargs["shell"], expected_popen_arg)
+        mock_safer_popen = self._do_shell_combo(value_in_call, value_from_class)
+        mock_safer_popen.assert_called_once()
+        self.assertIs(mock_safer_popen.call_args.kwargs["shell"], expected_popen_arg)
 
     @ddt.idata(full_case[:2] for full_case in _shell_cases)
     def test_it_logs_if_it_uses_a_shell(self, case):
         """``shell=`` in the log message agrees with what is passed to `Popen`."""
         value_in_call, value_from_class = case
-        with self.assertLogs(cmd.log, level=logging.DEBUG) as log_watcher:
-            mock_popen = self._do_shell_combo(value_in_call, value_from_class)
-        self._assert_logged_for_popen(log_watcher, "shell", mock_popen.call_args.kwargs["shell"])
+        with self.assertLogs(cmd.__name__, level=logging.DEBUG) as log_watcher:
+            mock_safer_popen = self._do_shell_combo(value_in_call, value_from_class)
+        self._assert_logged_for_popen(log_watcher, "shell", mock_safer_popen.call_args.kwargs["shell"])
 
     @ddt.data(
         ("None", None),
@@ -127,29 +193,56 @@ class TestGit(TestBase):
     )
     def test_it_logs_istream_summary_for_stdin(self, case):
         expected_summary, istream_argument = case
-        with self.assertLogs(cmd.log, level=logging.DEBUG) as log_watcher:
+        with self.assertLogs(cmd.__name__, level=logging.DEBUG) as log_watcher:
             self.git.execute(["git", "version"], istream=istream_argument)
         self._assert_logged_for_popen(log_watcher, "stdin", expected_summary)
 
     def test_it_executes_git_and_returns_result(self):
         self.assertRegex(self.git.execute(["git", "version"]), r"^git version [\d\.]{2}.*$")
 
-    def test_it_executes_git_not_from_cwd(self):
-        with TemporaryDirectory() as tmpdir:
-            if os.name == "nt":
-                # Copy an actual binary executable that is not git.
-                other_exe_path = os.path.join(os.getenv("WINDIR"), "system32", "hostname.exe")
-                impostor_path = os.path.join(tmpdir, "git.exe")
-                shutil.copy(other_exe_path, impostor_path)
-            else:
-                # Create a shell script that doesn't do anything.
-                impostor_path = os.path.join(tmpdir, "git")
-                with open(impostor_path, mode="w", encoding="utf-8") as file:
-                    print("#!/bin/sh", file=file)
-                os.chmod(impostor_path, 0o755)
+    @ddt.data(
+        # chdir_to_repo, shell, command, use_shell_impostor
+        (False, False, ["git", "version"], False),
+        (False, True, "git version", False),
+        (False, True, "git version", True),
+        (True, False, ["git", "version"], False),
+        (True, True, "git version", False),
+        (True, True, "git version", True),
+    )
+    @with_rw_directory
+    def test_it_executes_git_not_from_cwd(self, rw_dir, case):
+        chdir_to_repo, shell, command, use_shell_impostor = case
 
-            with cwd(tmpdir):
-                self.assertRegex(self.git.execute(["git", "version"]), r"^git version\b")
+        repo = Repo.init(rw_dir)
+
+        if os.name == "nt":
+            # Copy an actual binary executable that is not git. (On Windows, running
+            # "hostname" only displays the hostname, it never tries to change it.)
+            other_exe_path = Path(os.environ["SystemRoot"], "system32", "hostname.exe")
+            impostor_path = Path(rw_dir, "git.exe")
+            shutil.copy(other_exe_path, impostor_path)
+        else:
+            # Create a shell script that doesn't do anything.
+            impostor_path = Path(rw_dir, "git")
+            impostor_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(impostor_path, 0o755)
+
+        if use_shell_impostor:
+            shell_name = "cmd.exe" if os.name == "nt" else "sh"
+            shutil.copy(impostor_path, Path(rw_dir, shell_name))
+
+        with contextlib.ExitStack() as stack:
+            if chdir_to_repo:
+                stack.enter_context(cwd(rw_dir))
+            if use_shell_impostor:
+                stack.enter_context(_patch_out_env("ComSpec"))
+
+            # Run the command without raising an exception on failure, as the exception
+            # message is currently misleading when the command is a string rather than a
+            # sequence of strings (it really runs "git", but then wrongly reports "g").
+            output = repo.git.execute(command, with_exceptions=False, shell=shell)
+
+        self.assertRegex(output, r"^git version\b")
 
     @skipUnless(
         os.name == "nt",
@@ -194,13 +287,9 @@ class TestGit(TestBase):
         self.assertTrue("pass_this_kwarg" not in git.call_args[1])
 
     def test_it_raises_proper_exception_with_output_stream(self):
-        tmp_file = TemporaryFile()
-        self.assertRaises(
-            GitCommandError,
-            self.git.checkout,
-            "non-existent-branch",
-            output_stream=tmp_file,
-        )
+        with tempfile.TemporaryFile() as tmp_file:
+            with self.assertRaises(GitCommandError):
+                self.git.checkout("non-existent-branch", output_stream=tmp_file)
 
     def test_it_accepts_environment_variables(self):
         filename = fixture_path("ls_tree_empty")
@@ -248,29 +337,348 @@ class TestGit(TestBase):
         self.assertEqual(typename, typename_two)
         self.assertEqual(size, size_two)
 
-    def test_version(self):
+    def test_version_info(self):
+        """The version_info attribute is a tuple of up to four ints."""
         v = self.git.version_info
         self.assertIsInstance(v, tuple)
+        self.assertLessEqual(len(v), 4)
         for n in v:
             self.assertIsInstance(n, int)
-        # END verify number types
+
+    def test_version_info_pickleable(self):
+        """The version_info attribute is usable on unpickled Git instances."""
+        deserialized = pickle.loads(pickle.dumps(self.git))
+        v = deserialized.version_info
+        self.assertIsInstance(v, tuple)
+        self.assertLessEqual(len(v), 4)
+        for n in v:
+            self.assertIsInstance(n, int)
+
+    @ddt.data(
+        (("123", "456", "789"), (123, 456, 789)),
+        (("12", "34", "56", "78"), (12, 34, 56, 78)),
+        (("12", "34", "56", "78", "90"), (12, 34, 56, 78)),
+        (("1", "2", "a", "3"), (1, 2)),
+        (("1", "-2", "3"), (1,)),
+        (("1", "2a", "3"), (1,)),  # Subject to change.
+    )
+    def test_version_info_is_leading_numbers(self, case):
+        fake_fields, expected_version_info = case
+        with _rollback_refresh():
+            with _fake_git(*fake_fields) as path:
+                refresh(path)
+                new_git = Git()
+                self.assertEqual(new_git.version_info, expected_version_info)
+
+    def test_git_exc_name_is_git(self):
+        self.assertEqual(self.git.git_exec_name, "git")
 
     def test_cmd_override(self):
-        with mock.patch.object(
-            type(self.git),
-            "GIT_PYTHON_GIT_EXECUTABLE",
-            osp.join("some", "path", "which", "doesn't", "exist", "gitbinary"),
-        ):
-            self.assertRaises(GitCommandNotFound, self.git.version)
+        """Directly set bad GIT_PYTHON_GIT_EXECUTABLE causes git operations to raise."""
+        bad_path = osp.join("some", "path", "which", "doesn't", "exist", "gitbinary")
+        with mock.patch.object(Git, "GIT_PYTHON_GIT_EXECUTABLE", bad_path):
+            with self.assertRaises(GitCommandNotFound) as ctx:
+                self.git.version()
+            self.assertEqual(ctx.exception.command, [bad_path, "version"])
 
-    def test_refresh(self):
-        # Test a bad git path refresh.
-        self.assertRaises(GitCommandNotFound, refresh, "yada")
+    @ddt.data(("0",), ("q",), ("quiet",), ("s",), ("silence",), ("silent",), ("n",), ("none",))
+    def test_initial_refresh_from_bad_git_path_env_quiet(self, case):
+        """In "q" mode, bad initial path sets "git" and is quiet."""
+        (mode,) = case
+        set_vars = {
+            "GIT_PYTHON_GIT_EXECUTABLE": str(Path("yada").absolute()),  # Any bad path.
+            "GIT_PYTHON_REFRESH": mode,
+        }
+        with _rollback_refresh():
+            Git.GIT_PYTHON_GIT_EXECUTABLE = None  # Simulate startup.
 
-        # Test a good path refresh.
-        which_cmd = "where" if os.name == "nt" else "command -v"
-        path = os.popen("{0} git".format(which_cmd)).read().strip().split("\n")[0]
-        refresh(path)
+            with mock.patch.dict(os.environ, set_vars):
+                refresh()
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, "git")
+
+    @ddt.data(("1",), ("w",), ("warn",), ("warning",), ("l",), ("log",))
+    def test_initial_refresh_from_bad_git_path_env_warn(self, case):
+        """In "w" mode, bad initial path sets "git" and warns, by logging."""
+        (mode,) = case
+        env_vars = {
+            "GIT_PYTHON_GIT_EXECUTABLE": str(Path("yada").absolute()),  # Any bad path.
+            "GIT_PYTHON_REFRESH": mode,
+        }
+        with _rollback_refresh():
+            Git.GIT_PYTHON_GIT_EXECUTABLE = None  # Simulate startup.
+
+            with mock.patch.dict(os.environ, env_vars):
+                with self.assertLogs(cmd.__name__, logging.CRITICAL) as ctx:
+                    refresh()
+                self.assertEqual(len(ctx.records), 1)
+                message = ctx.records[0].getMessage()
+                self.assertRegex(message, r"\ABad git executable.\n")
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, "git")
+
+    @ddt.data(("2",), ("r",), ("raise",), ("e",), ("error",))
+    def test_initial_refresh_from_bad_git_path_env_error(self, case):
+        """In "e" mode, bad initial path raises an exception."""
+        (mode,) = case
+        env_vars = {
+            "GIT_PYTHON_GIT_EXECUTABLE": str(Path("yada").absolute()),  # Any bad path.
+            "GIT_PYTHON_REFRESH": mode,
+        }
+        with _rollback_refresh():
+            Git.GIT_PYTHON_GIT_EXECUTABLE = None  # Simulate startup.
+
+            with mock.patch.dict(os.environ, env_vars):
+                with self.assertRaisesRegex(ImportError, r"\ABad git executable.\n"):
+                    refresh()
+
+    def test_initial_refresh_from_good_absolute_git_path_env(self):
+        """Good initial absolute path from environment is set."""
+        absolute_path = shutil.which("git")
+
+        with _rollback_refresh():
+            Git.GIT_PYTHON_GIT_EXECUTABLE = None  # Simulate startup.
+
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": absolute_path}):
+                refresh()
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, absolute_path)
+
+    def test_initial_refresh_from_good_relative_git_path_env(self):
+        """Good initial relative path from environment is kept relative and set."""
+        with _rollback_refresh():
+            # Set the fallback to a string that wouldn't work and isn't "git", so we are
+            # more likely to detect if "git" is not set from the environment variable.
+            with mock.patch.object(Git, "git_exec_name", ""):
+                Git.GIT_PYTHON_GIT_EXECUTABLE = None  # Simulate startup.
+
+                # Now observe if setting the environment variable to "git" takes effect.
+                with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": "git"}):
+                    refresh()
+                    self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, "git")
+
+    def test_refresh_from_bad_absolute_git_path_env(self):
+        """Bad absolute path from environment is reported and not set."""
+        absolute_path = str(Path("yada").absolute())
+        expected_pattern = rf"\n[ \t]*cmdline: {re.escape(absolute_path)}\Z"
+
+        with _rollback_refresh() as old_git_executable:
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": absolute_path}):
+                with self.assertRaisesRegex(GitCommandNotFound, expected_pattern):
+                    refresh()
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, old_git_executable)
+
+    def test_refresh_from_bad_relative_git_path_env(self):
+        """Bad relative path from environment is kept relative and reported, not set."""
+        # Relative paths are not resolved when refresh() is called with no arguments, so
+        # use a string that's very unlikely to be a command name found in a path lookup.
+        relative_path = "yada-e47e70c6-acbf-40f8-ad65-13af93c2195b"
+        expected_pattern = rf"\n[ \t]*cmdline: {re.escape(relative_path)}\Z"
+
+        with _rollback_refresh() as old_git_executable:
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": relative_path}):
+                with self.assertRaisesRegex(GitCommandNotFound, expected_pattern):
+                    refresh()
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, old_git_executable)
+
+    def test_refresh_from_good_absolute_git_path_env(self):
+        """Good absolute path from environment is set."""
+        absolute_path = shutil.which("git")
+
+        with _rollback_refresh():
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": absolute_path}):
+                refresh()
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, absolute_path)
+
+    def test_refresh_from_good_relative_git_path_env(self):
+        """Good relative path from environment is kept relative and set."""
+        with _rollback_refresh():
+            # Set as the executable name a string that wouldn't work and isn't "git".
+            Git.GIT_PYTHON_GIT_EXECUTABLE = ""
+
+            # Now observe if setting the environment variable to "git" takes effect.
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": "git"}):
+                refresh()
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, "git")
+
+    def test_refresh_with_bad_absolute_git_path_arg(self):
+        """Bad absolute path arg is reported and not set."""
+        absolute_path = str(Path("yada").absolute())
+        expected_pattern = rf"\n[ \t]*cmdline: {re.escape(absolute_path)}\Z"
+
+        with _rollback_refresh() as old_git_executable:
+            with self.assertRaisesRegex(GitCommandNotFound, expected_pattern):
+                refresh(absolute_path)
+            self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, old_git_executable)
+
+    def test_refresh_with_bad_relative_git_path_arg(self):
+        """Bad relative path arg is resolved to absolute path and reported, not set."""
+        absolute_path = str(Path("yada").absolute())
+        expected_pattern = rf"\n[ \t]*cmdline: {re.escape(absolute_path)}\Z"
+
+        with _rollback_refresh() as old_git_executable:
+            with self.assertRaisesRegex(GitCommandNotFound, expected_pattern):
+                refresh("yada")
+            self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, old_git_executable)
+
+    def test_refresh_with_good_absolute_git_path_arg(self):
+        """Good absolute path arg is set."""
+        absolute_path = shutil.which("git")
+
+        with _rollback_refresh():
+            refresh(absolute_path)
+            self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, absolute_path)
+
+    def test_refresh_with_good_relative_git_path_arg(self):
+        """Good relative path arg is resolved to absolute path and set."""
+        absolute_path = shutil.which("git")
+        dirname, basename = osp.split(absolute_path)
+
+        with cwd(dirname):
+            with _rollback_refresh():
+                refresh(basename)
+                self.assertEqual(self.git.GIT_PYTHON_GIT_EXECUTABLE, absolute_path)
+
+    def test_version_info_is_cached(self):
+        fake_version_info = (123, 456, 789)
+        with _rollback_refresh():
+            with _fake_git(*fake_version_info) as path:
+                new_git = Git()  # Not cached yet.
+                refresh(path)
+                self.assertEqual(new_git.version_info, fake_version_info)
+                os.remove(path)  # Arrange that a second subprocess call would fail.
+                self.assertEqual(new_git.version_info, fake_version_info)
+
+    def test_version_info_cache_is_per_instance(self):
+        with _rollback_refresh():
+            with _fake_git(123, 456, 789) as path:
+                git1 = Git()
+                git2 = Git()
+                refresh(path)
+                git1.version_info
+                os.remove(path)  # Arrange that the second subprocess call will fail.
+                with self.assertRaises(GitCommandNotFound):
+                    git2.version_info
+                git1.version_info
+
+    def test_version_info_cache_is_not_pickled(self):
+        with _rollback_refresh():
+            with _fake_git(123, 456, 789) as path:
+                git1 = Git()
+                refresh(path)
+                git1.version_info
+                git2 = pickle.loads(pickle.dumps(git1))
+                os.remove(path)  # Arrange that the second subprocess call will fail.
+                with self.assertRaises(GitCommandNotFound):
+                    git2.version_info
+                git1.version_info
+
+    def test_successful_refresh_with_arg_invalidates_cached_version_info(self):
+        with _rollback_refresh():
+            with _fake_git(11, 111, 1) as path1:
+                with _fake_git(22, 222, 2) as path2:
+                    new_git = Git()
+                    refresh(path1)
+                    new_git.version_info
+                    refresh(path2)
+                    self.assertEqual(new_git.version_info, (22, 222, 2))
+
+    def test_failed_refresh_with_arg_does_not_invalidate_cached_version_info(self):
+        with _rollback_refresh():
+            with _fake_git(11, 111, 1) as path1:
+                with _fake_git(22, 222, 2) as path2:
+                    new_git = Git()
+                    refresh(path1)
+                    new_git.version_info
+                    os.remove(path1)  # Arrange that a repeat call for path1 would fail.
+                    os.remove(path2)  # Arrange that the new call for path2 will fail.
+                    with self.assertRaises(GitCommandNotFound):
+                        refresh(path2)
+                    self.assertEqual(new_git.version_info, (11, 111, 1))
+
+    def test_successful_refresh_with_same_arg_invalidates_cached_version_info(self):
+        """Changing git at the same path and refreshing affects version_info."""
+        with _rollback_refresh():
+            with _fake_git(11, 111, 1) as path1:
+                with _fake_git(22, 222, 2) as path2:
+                    new_git = Git()
+                    refresh(path1)
+                    new_git.version_info
+                    shutil.copy(path2, path1)
+                    refresh(path1)  # The fake git at path1 has a different version now.
+                    self.assertEqual(new_git.version_info, (22, 222, 2))
+
+    def test_successful_refresh_with_env_invalidates_cached_version_info(self):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_rollback_refresh())
+            path1 = stack.enter_context(_fake_git(11, 111, 1))
+            path2 = stack.enter_context(_fake_git(22, 222, 2))
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": path1}):
+                new_git = Git()
+                refresh()
+                new_git.version_info
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": path2}):
+                refresh()
+                self.assertEqual(new_git.version_info, (22, 222, 2))
+
+    def test_failed_refresh_with_env_does_not_invalidate_cached_version_info(self):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_rollback_refresh())
+            path1 = stack.enter_context(_fake_git(11, 111, 1))
+            path2 = stack.enter_context(_fake_git(22, 222, 2))
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": path1}):
+                new_git = Git()
+                refresh()
+                new_git.version_info
+            os.remove(path1)  # Arrange that a repeat call for path1 would fail.
+            os.remove(path2)  # Arrange that the new call for path2 will fail.
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": path2}):
+                with self.assertRaises(GitCommandNotFound):
+                    refresh(path2)
+                self.assertEqual(new_git.version_info, (11, 111, 1))
+
+    def test_successful_refresh_with_same_env_invalidates_cached_version_info(self):
+        """Changing git at the same path/command and refreshing affects version_info."""
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_rollback_refresh())
+            path1 = stack.enter_context(_fake_git(11, 111, 1))
+            path2 = stack.enter_context(_fake_git(22, 222, 2))
+            with mock.patch.dict(os.environ, {"GIT_PYTHON_GIT_EXECUTABLE": path1}):
+                new_git = Git()
+                refresh()
+                new_git.version_info
+                shutil.copy(path2, path1)
+                refresh()  # The fake git at path1 has a different version now.
+                self.assertEqual(new_git.version_info, (22, 222, 2))
+
+    def test_successful_default_refresh_invalidates_cached_version_info(self):
+        """Refreshing updates version after a filesystem change adds a git command."""
+        # The key assertion here is the last. The others mainly verify the test itself.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_rollback_refresh())
+
+            path1 = Path(stack.enter_context(_fake_git(11, 111, 1)))
+            path2 = Path(stack.enter_context(_fake_git(22, 222, 2)))
+
+            new_path_var = f"{path1.parent}{os.pathsep}{path2.parent}"
+            stack.enter_context(mock.patch.dict(os.environ, {"PATH": new_path_var}))
+            stack.enter_context(_patch_out_env("GIT_PYTHON_GIT_EXECUTABLE"))
+
+            if os.name == "nt":
+                # On Windows, use a shell so "git" finds "git.cmd". (In the infrequent
+                # case that this effect is desired in production code, it should not be
+                # done with this technique. USE_SHELL=True is less secure and reliable,
+                # as unintended shell expansions can occur, and is deprecated. Instead,
+                # use a custom command, by setting the GIT_PYTHON_GIT_EXECUTABLE
+                # environment variable to git.cmd or by passing git.cmd's full path to
+                # git.refresh. Or wrap the script with a .exe shim.
+                stack.enter_context(mock.patch.object(Git, "USE_SHELL", True))
+
+            new_git = Git()
+            _rename_with_stem(path2, "git")  # "Install" git, "late" in the PATH.
+            refresh()
+            self.assertEqual(new_git.version_info, (22, 222, 2), 'before "downgrade"')
+            _rename_with_stem(path1, "git")  # "Install" another, higher priority.
+            self.assertEqual(new_git.version_info, (22, 222, 2), "stale version")
+            refresh()
+            self.assertEqual(new_git.version_info, (11, 111, 1), "fresh version")
 
     def test_options_are_passed_to_git(self):
         # This works because any command after git --version is ignored.
@@ -345,7 +753,7 @@ class TestGit(TestBase):
                 self.assertIn("FOO", str(err))
 
     def test_handle_process_output(self):
-        from git.cmd import handle_process_output
+        from git.cmd import handle_process_output, safer_popen
 
         line_count = 5002
         count = [None, 0, 0]
@@ -361,13 +769,12 @@ class TestGit(TestBase):
             fixture_path("cat_file.py"),
             str(fixture_path("issue-301_stderr")),
         ]
-        proc = subprocess.Popen(
+        proc = safer_popen(
             cmdline,
             stdin=None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
-            creationflags=cmd.PROC_CREATIONFLAGS,
         )
 
         handle_process_output(proc, counter_stdout, counter_stderr, finalize_process)

@@ -40,6 +40,7 @@ from .util import (
 
 
 # typing ----------------------------------------------------------------------
+
 from typing import Callable, Dict, Mapping, Sequence, TYPE_CHECKING, cast
 from typing import Any, Iterator, Union
 
@@ -50,14 +51,11 @@ if TYPE_CHECKING:
     from git.repo import Repo
     from git.refs import Head
 
-
 # -----------------------------------------------------------------------------
 
 __all__ = ["Submodule", "UpdateProgress"]
 
-
-log = logging.getLogger("git.objects.submodule.base")
-log.addHandler(logging.NullHandler())
+_logger = logging.getLogger(__name__)
 
 
 class UpdateProgress(RemoteProgress):
@@ -77,9 +75,9 @@ FETCH = UpdateProgress.FETCH
 UPDWKTREE = UpdateProgress.UPDWKTREE
 
 
-# IndexObject comes via util module, its a 'hacky' fix thanks to pythons import
-# mechanism which cause plenty of trouble of the only reason for packages and
-# modules is refactoring - subpackages shouldn't depend on parent packages
+# IndexObject comes via the util module. It's a 'hacky' fix thanks to Python's import
+# mechanism, which causes plenty of trouble if the only reason for packages and
+# modules is refactoring - subpackages shouldn't depend on parent packages.
 class Submodule(IndexObject, TraversableIterableObj):
     """Implements access to a git submodule. They are special in that their sha
     represents a commit in the submodule's repository which is to be checked out
@@ -95,10 +93,11 @@ class Submodule(IndexObject, TraversableIterableObj):
     k_modules_file = ".gitmodules"
     k_head_option = "branch"
     k_head_default = "master"
-    k_default_mode = stat.S_IFDIR | stat.S_IFLNK  # Submodules are directories with link-status.
+    k_default_mode = stat.S_IFDIR | stat.S_IFLNK
+    """Submodule flags. Submodules are directories with link-status."""
 
-    # This is a bogus type for base class compatibility.
     type: Literal["submodule"] = "submodule"  # type: ignore
+    """This is a bogus type for base class compatibility."""
 
     __slots__ = ("_parent_commit", "_url", "_branch_path", "_name", "__weakref__")
 
@@ -730,7 +729,7 @@ class Submodule(IndexObject, TraversableIterableObj):
                         )
                         mrepo.head.reference.set_tracking_branch(remote_branch)
                     except (IndexError, InvalidGitRepositoryError):
-                        log.warning("Failed to checkout tracking branch %s", self.branch_path)
+                        _logger.warning("Failed to checkout tracking branch %s", self.branch_path)
                     # END handle tracking branch
 
                     # NOTE: Have to write the repo config file as well, otherwise the
@@ -760,14 +759,14 @@ class Submodule(IndexObject, TraversableIterableObj):
                         binsha = rcommit.binsha
                         hexsha = rcommit.hexsha
                     else:
-                        log.error(
+                        _logger.error(
                             "%s a tracking branch was not set for local branch '%s'",
                             msg_base,
                             mrepo.head.reference,
                         )
                     # END handle remote ref
                 else:
-                    log.error("%s there was no local tracking branch", msg_base)
+                    _logger.error("%s there was no local tracking branch", msg_base)
                 # END handle detached head
             # END handle to_latest_revision option
 
@@ -785,7 +784,7 @@ class Submodule(IndexObject, TraversableIterableObj):
                         if force:
                             msg = "Will force checkout or reset on local branch that is possibly in the future of"
                             msg += " the commit it will be checked out to, effectively 'forgetting' new commits"
-                            log.debug(msg)
+                            _logger.debug(msg)
                         else:
                             msg = "Skipping %s on branch '%s' of submodule repo '%s' as it contains un-pushed commits"
                             msg %= (
@@ -793,7 +792,7 @@ class Submodule(IndexObject, TraversableIterableObj):
                                 mrepo.head,
                                 mrepo,
                             )
-                            log.info(msg)
+                            _logger.info(msg)
                             may_reset = False
                         # END handle force
                     # END handle if we are in the future
@@ -833,7 +832,7 @@ class Submodule(IndexObject, TraversableIterableObj):
         except Exception as err:
             if not keep_going:
                 raise
-            log.error(str(err))
+            _logger.error(str(err))
         # END handle keep_going
 
         # HANDLE RECURSION
@@ -1401,7 +1400,7 @@ class Submodule(IndexObject, TraversableIterableObj):
             pc = repo.commit(parent_commit)  # Parent commit instance
             parser = cls._config_parser(repo, pc, read_only=True)
         except (IOError, BadName):
-            return iter([])
+            return
         # END handle empty iterator
 
         for sms in parser.sections():

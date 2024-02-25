@@ -15,7 +15,7 @@ from types import TracebackType
 
 from typing import Any, Callable, TYPE_CHECKING, Optional, Type
 
-from git.types import PathLike, _T
+from git.types import Literal, PathLike, _T
 
 if TYPE_CHECKING:
     from git.index import IndexFile
@@ -41,7 +41,8 @@ class TemporaryFileSwap:
 
     def __init__(self, file_path: PathLike) -> None:
         self.file_path = file_path
-        fd, self.tmp_file_path = tempfile.mkstemp(prefix=self.file_path, dir="")
+        dirname, basename = osp.split(file_path)
+        fd, self.tmp_file_path = tempfile.mkstemp(prefix=basename, dir=dirname)
         os.close(fd)
         with contextlib.suppress(OSError):  # It may be that the source does not exist.
             os.replace(self.file_path, self.tmp_file_path)
@@ -54,7 +55,7 @@ class TemporaryFileSwap:
         exc_type: Optional[Type[BaseException]],
         exc_val: Optional[BaseException],
         exc_tb: Optional[TracebackType],
-    ) -> bool:
+    ) -> Literal[False]:
         if osp.isfile(self.tmp_file_path):
             os.replace(self.tmp_file_path, self.file_path)
         return False

@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import contextlib
 import io
+import itertools
 import logging
 import os
 import signal
@@ -25,7 +26,6 @@ from git.exc import (
     UnsafeProtocolError,
 )
 from git.util import (
-    LazyMixin,
     cygpath,
     expand_path,
     is_cygwin_git,
@@ -46,6 +46,7 @@ from typing import (
     Iterator,
     List,
     Mapping,
+    Optional,
     Sequence,
     TYPE_CHECKING,
     TextIO,
@@ -80,8 +81,7 @@ execute_kwargs = {
     "strip_newline_in_stdout",
 }
 
-log = logging.getLogger(__name__)
-log.addHandler(logging.NullHandler())
+_logger = logging.getLogger(__name__)
 
 __all__ = ("Git",)
 
@@ -102,7 +102,7 @@ def handle_process_output(
         Callable[[bytes, "Repo", "DiffIndex"], None],
     ],
     stderr_handler: Union[None, Callable[[AnyStr], None], Callable[[List[AnyStr]], None]],
-    finalizer: Union[None, Callable[[Union[subprocess.Popen, "Git.AutoInterrupt"]], None]] = None,
+    finalizer: Union[None, Callable[[Union[Popen, "Git.AutoInterrupt"]], None]] = None,
     decode_streams: bool = True,
     kill_after_timeout: Union[None, float] = None,
 ) -> None:
@@ -111,7 +111,6 @@ def handle_process_output(
 
     This function returns once the finalizer returns.
 
-    :return: Result of finalizer
     :param process: :class:`subprocess.Popen` instance
     :param stdout_handler: f(stdout_line_string), or None
     :param stderr_handler: f(stderr_line_string), or None
@@ -146,7 +145,7 @@ def handle_process_output(
                         handler(line)
 
         except Exception as ex:
-            log.error(f"Pumping {name!r} of cmd({remove_password_if_present(cmdline)}) failed due to: {ex!r}")
+            _logger.error(f"Pumping {name!r} of cmd({remove_password_if_present(cmdline)}) failed due to: {ex!r}")
             if "I/O operation on closed file" not in str(ex):
                 # Only reraise if the error was not due to the stream closing
                 raise CommandError([f"<{name}-pump>"] + remove_password_if_present(cmdline), ex) from ex
@@ -205,9 +204,69 @@ def handle_process_output(
                 stderr_handler(error_str)  # type: ignore
 
     if finalizer:
-        return finalizer(process)
+        finalizer(process)
+
+
+def _safer_popen_windows(
+    command: Union[str, Sequence[Any]],
+    *,
+    shell: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+    **kwargs: Any,
+) -> Popen:
+    """Call :class:`subprocess.Popen` on Windows but don't include a CWD in the search.
+
+    This avoids an untrusted search path condition where a file like ``git.exe`` in a
+    malicious repository would be run when GitPython operates on the repository. The
+    process using GitPython may have an untrusted repository's working tree as its
+    current working directory. Some operations may temporarily change to that directory
+    before running a subprocess. In addition, while by default GitPython does not run
+    external commands with a shell, it can be made to do so, in which case the CWD of
+    the subprocess, which GitPython usually sets to a repository working tree, can
+    itself be searched automatically by the shell. This wrapper covers all those cases.
+
+    :note: This currently works by setting the ``NoDefaultCurrentDirectoryInExePath``
+        environment variable during subprocess creation. It also takes care of passing
+        Windows-specific process creation flags, but that is unrelated to path search.
+
+    :note: The current implementation contains a race condition on :attr:`os.environ`.
+        GitPython isn't thread-safe, but a program using it on one thread should ideally
+        be able to mutate :attr:`os.environ` on another, without unpredictable results.
+        See comments in https://github.com/gitpython-developers/GitPython/pull/1650.
+    """
+    # CREATE_NEW_PROCESS_GROUP is needed for some ways of killing it afterwards. See:
+    # https://docs.python.org/3/library/subprocess.html#subprocess.Popen.send_signal
+    # https://docs.python.org/3/library/subprocess.html#subprocess.CREATE_NEW_PROCESS_GROUP
+    creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+
+    # When using a shell, the shell is the direct subprocess, so the variable must be
+    # set in its environment, to affect its search behavior. (The "1" can be any value.)
+    if shell:
+        safer_env = {} if env is None else dict(env)
+        safer_env["NoDefaultCurrentDirectoryInExePath"] = "1"
     else:
-        return None
+        safer_env = env
+
+    # When not using a shell, the current process does the search in a CreateProcessW
+    # API call, so the variable must be set in our environment. With a shell, this is
+    # unnecessary, in versions where https://github.com/python/cpython/issues/101283 is
+    # patched. If not, in the rare case the ComSpec environment variable is unset, the
+    # shell is searched for unsafely. Setting NoDefaultCurrentDirectoryInExePath in all
+    # cases, as here, is simpler and protects against that. (The "1" can be any value.)
+    with patch_env("NoDefaultCurrentDirectoryInExePath", "1"):
+        return Popen(
+            command,
+            shell=shell,
+            env=safer_env,
+            creationflags=creationflags,
+            **kwargs,
+        )
+
+
+if os.name == "nt":
+    safer_popen = _safer_popen_windows
+else:
+    safer_popen = Popen
 
 
 def dashify(string: str) -> str:
@@ -228,15 +287,7 @@ def dict_to_slots_and__excluded_are_none(self: object, d: Mapping[str, Any], exc
 ## -- End Utilities -- @}
 
 
-if os.name == "nt":
-    # CREATE_NEW_PROCESS_GROUP is needed to allow killing it afterwards. See:
-    # https://docs.python.org/3/library/subprocess.html#subprocess.Popen.send_signal
-    PROC_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-else:
-    PROC_CREATIONFLAGS = 0
-
-
-class Git(LazyMixin):
+class Git:
     """The Git class manages communication with the Git binary.
 
     It provides a convenient interface to calling the Git binary, such as in::
@@ -256,12 +307,18 @@ class Git(LazyMixin):
         "cat_file_all",
         "cat_file_header",
         "_version_info",
+        "_version_info_token",
         "_git_options",
         "_persistent_git_options",
         "_environment",
     )
 
-    _excluded_ = ("cat_file_all", "cat_file_header", "_version_info")
+    _excluded_ = (
+        "cat_file_all",
+        "cat_file_header",
+        "_version_info",
+        "_version_info_token",
+    )
 
     re_unsafe_protocol = re.compile(r"(.+)::.+")
 
@@ -273,27 +330,82 @@ class Git(LazyMixin):
 
     # CONFIGURATION
 
-    git_exec_name = "git"  # Default that should work on Linux and Windows.
+    git_exec_name = "git"
+    """Default git command that should work on Linux, Windows, and other systems."""
 
-    # Enables debugging of GitPython's git commands.
     GIT_PYTHON_TRACE = os.environ.get("GIT_PYTHON_TRACE", False)
+    """Enables debugging of GitPython's git commands."""
 
-    # If True, a shell will be used when executing git commands.
-    # This should only be desirable on Windows, see https://github.com/gitpython-developers/GitPython/pull/126
-    # and check `git/test_repo.py:TestRepo.test_untracked_files()` TC for an example where it is required.
-    # Override this value using `Git.USE_SHELL = True`.
     USE_SHELL = False
+    """Deprecated. If set to True, a shell will be used when executing git commands.
 
-    # Provide the full path to the git executable. Otherwise it assumes git is in the path.
+    Prior to GitPython 2.0.8, this had a narrow purpose in suppressing console windows
+    in graphical Windows applications. In 2.0.8 and higher, it provides no benefit, as
+    GitPython solves that problem more robustly and safely by using the
+    ``CREATE_NO_WINDOW`` process creation flag on Windows.
+
+    Code that uses ``USE_SHELL = True`` or that passes ``shell=True`` to any GitPython
+    functions should be updated to use the default value of ``False`` instead. ``True``
+    is unsafe unless the effect of shell expansions is fully considered and accounted
+    for, which is not possible under most circumstances.
+
+    See:
+
+    - :meth:`Git.execute` (on the ``shell`` parameter).
+    - https://github.com/gitpython-developers/GitPython/commit/0d9390866f9ce42870d3116094cd49e0019a970a
+    - https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+    """
+
     _git_exec_env_var = "GIT_PYTHON_GIT_EXECUTABLE"
     _refresh_env_var = "GIT_PYTHON_REFRESH"
+
     GIT_PYTHON_GIT_EXECUTABLE = None
-    # Note that the git executable is actually found during the refresh step in
-    # the top level __init__.
+    """Provide the full path to the git executable. Otherwise it assumes git is in the path.
+
+    :note: The git executable is actually found during the refresh step in
+        the top level :mod:`__init__`. It can also be changed by explicitly calling
+        :func:`git.refresh`.
+    """
+
+    _refresh_token = object()  # Since None would match an initial _version_info_token.
 
     @classmethod
     def refresh(cls, path: Union[None, PathLike] = None) -> bool:
-        """This gets called by the refresh function (see the top level __init__)."""
+        """This gets called by the refresh function (see the top level __init__).
+
+        :param path: Optional path to the git executable. If not absolute, it is
+            resolved immediately, relative to the current directory. (See note below.)
+
+        :note: The top-level :func:`git.refresh` should be preferred because it calls
+            this method and may also update other state accordingly.
+
+        :note: There are three different ways to specify what command refreshing causes
+            to be uses for git:
+
+            1. Pass no *path* argument and do not set the ``GIT_PYTHON_GIT_EXECUTABLE``
+               environment variable. The command name ``git`` is used. It is looked up
+               in a path search by the system, in each command run (roughly similar to
+               how git is found when running ``git`` commands manually). This is usually
+               the desired behavior.
+
+            2. Pass no *path* argument but set the ``GIT_PYTHON_GIT_EXECUTABLE``
+               environment variable. The command given as the value of that variable is
+               used. This may be a simple command or an arbitrary path. It is looked up
+               in each command run. Setting ``GIT_PYTHON_GIT_EXECUTABLE`` to ``git`` has
+               the same effect as not setting it.
+
+            3. Pass a *path* argument. This path, if not absolute, it immediately
+               resolved, relative to the current directory. This resolution occurs at
+               the time of the refresh, and when git commands are run, they are run with
+               that previously resolved path. If a *path* argument is passed, the
+               ``GIT_PYTHON_GIT_EXECUTABLE`` environment variable is not consulted.
+
+        :note: Refreshing always sets the :attr:`Git.GIT_PYTHON_GIT_EXECUTABLE` class
+            attribute, which can be read on the :class:`Git` class or any of its
+            instances to check what command is used to run git. This attribute should
+            not be confused with the related ``GIT_PYTHON_GIT_EXECUTABLE`` environment
+            variable. The class attribute is set no matter how refreshing is performed.
+        """
         # Discern which path to refresh with.
         if path is not None:
             new_git = os.path.expanduser(path)
@@ -303,7 +415,9 @@ class Git(LazyMixin):
 
         # Keep track of the old and new git executable path.
         old_git = cls.GIT_PYTHON_GIT_EXECUTABLE
+        old_refresh_token = cls._refresh_token
         cls.GIT_PYTHON_GIT_EXECUTABLE = new_git
+        cls._refresh_token = object()
 
         # Test if the new git executable path is valid. A GitCommandNotFound error is
         # spawned by us. A PermissionError is spawned if the git executable cannot be
@@ -324,7 +438,7 @@ class Git(LazyMixin):
                 The git executable must be specified in one of the following ways:
                     - be included in your $PATH
                     - be set via $%s
-                    - explicitly set via git.refresh()
+                    - explicitly set via git.refresh("/full/path/to/git")
                 """
                 )
                 % cls._git_exec_env_var
@@ -332,6 +446,7 @@ class Git(LazyMixin):
 
             # Revert to whatever the old_git was.
             cls.GIT_PYTHON_GIT_EXECUTABLE = old_git
+            cls._refresh_token = old_refresh_token
 
             if old_git is None:
                 # On the first refresh (when GIT_PYTHON_GIT_EXECUTABLE is None) we only
@@ -341,15 +456,15 @@ class Git(LazyMixin):
                 # expect GIT_PYTHON_REFRESH to either be unset or be one of the
                 # following values:
                 #
-                #   0|q|quiet|s|silence|n|none
-                #   1|w|warn|warning
-                #   2|r|raise|e|error
+                #   0|q|quiet|s|silence|silent|n|none
+                #   1|w|warn|warning|l|log
+                #   2|r|raise|e|error|exception
 
                 mode = os.environ.get(cls._refresh_env_var, "raise").lower()
 
-                quiet = ["quiet", "q", "silence", "s", "none", "n", "0"]
-                warn = ["warn", "w", "warning", "1"]
-                error = ["error", "e", "raise", "r", "2"]
+                quiet = ["quiet", "q", "silence", "s", "silent", "none", "n", "0"]
+                warn = ["warn", "w", "warning", "log", "l", "1"]
+                error = ["error", "e", "exception", "raise", "r", "2"]
 
                 if mode in quiet:
                     pass
@@ -360,10 +475,10 @@ class Git(LazyMixin):
                         %s
                         All git commands will error until this is rectified.
 
-                        This initial warning can be silenced or aggravated in the future by setting the
+                        This initial message can be silenced or aggravated in the future by setting the
                         $%s environment variable. Use one of the following values:
-                            - %s: for no warning or exception
-                            - %s: for a printed warning
+                            - %s: for no message or exception
+                            - %s: for a warning message (logged at level CRITICAL, displayed by default)
                             - %s: for a raised exception
 
                         Example:
@@ -382,7 +497,7 @@ class Git(LazyMixin):
                     )
 
                     if mode in warn:
-                        print("WARNING: %s" % err)
+                        _logger.critical(err)
                     else:
                         raise ImportError(err)
                 else:
@@ -392,8 +507,8 @@ class Git(LazyMixin):
                         %s environment variable has been set but it has been set with an invalid value.
 
                         Use only the following values:
-                            - %s: for no warning or exception
-                            - %s: for a printed warning
+                            - %s: for no message or exception
+                            - %s: for a warning message (logged at level CRITICAL, displayed by default)
                             - %s: for a raised exception
                         """
                         )
@@ -406,14 +521,15 @@ class Git(LazyMixin):
                     )
                     raise ImportError(err)
 
-                # We get here if this was the init refresh and the refresh mode was not
-                # error. Go ahead and set the GIT_PYTHON_GIT_EXECUTABLE such that we
-                # discern the difference between a first import and a second import.
+                # We get here if this was the initial refresh and the refresh mode was
+                # not error. Go ahead and set the GIT_PYTHON_GIT_EXECUTABLE such that we
+                # discern the difference between the first refresh at import time
+                # and subsequent calls to git.refresh or this refresh method.
                 cls.GIT_PYTHON_GIT_EXECUTABLE = cls.git_exec_name
             else:
                 # After the first refresh (when GIT_PYTHON_GIT_EXECUTABLE is no longer
                 # None) we raise an exception.
-                raise GitCommandNotFound("git", err)
+                raise GitCommandNotFound(new_git, err)
 
         return has_git
 
@@ -530,7 +646,7 @@ class Git(LazyMixin):
                     self.status = self._status_code_if_terminate or proc.poll()
                     return
             except OSError as ex:
-                log.info("Ignored error after process had died: %r", ex)
+                _logger.info("Ignored error after process had died: %r", ex)
 
             # It can be that nothing really exists anymore...
             if os is None or getattr(os, "kill", None) is None:
@@ -543,7 +659,7 @@ class Git(LazyMixin):
 
                 self.status = self._status_code_if_terminate or status
             except OSError as ex:
-                log.info("Ignored error after process had died: %r", ex)
+                _logger.info("Ignored error after process had died: %r", ex)
             # END exception handling
 
         def __del__(self) -> None:
@@ -584,7 +700,7 @@ class Git(LazyMixin):
 
             if status != 0:
                 errstr = read_all_from_possibly_closed_stream(p_stderr)
-                log.debug("AutoInterrupt wait stderr: %r" % (errstr,))
+                _logger.debug("AutoInterrupt wait stderr: %r" % (errstr,))
                 raise GitCommandError(remove_password_if_present(self.args), status, errstr)
             return status
 
@@ -714,6 +830,10 @@ class Git(LazyMixin):
         # Extra environment variables to pass to git commands
         self._environment: Dict[str, str] = {}
 
+        # Cached version slots
+        self._version_info: Union[Tuple[int, ...], None] = None
+        self._version_info_token: object = None
+
         # Cached command slots
         self.cat_file_header: Union[None, TBD] = None
         self.cat_file_all: Union[None, TBD] = None
@@ -726,8 +846,8 @@ class Git(LazyMixin):
             Callable object that will execute call :meth:`_call_process` with
             your arguments.
         """
-        if name[0] == "_":
-            return LazyMixin.__getattr__(self, name)
+        if name.startswith("_"):
+            return super().__getattribute__(name)
         return lambda *args, **kwargs: self._call_process(name, *args, **kwargs)
 
     def set_persistent_git_options(self, **kwargs: Any) -> None:
@@ -742,33 +862,36 @@ class Git(LazyMixin):
 
         self._persistent_git_options = self.transform_kwargs(split_single_char_options=True, **kwargs)
 
-    def _set_cache_(self, attr: str) -> None:
-        if attr == "_version_info":
-            # We only use the first 4 numbers, as everything else could be strings in fact (on Windows).
-            process_version = self._call_process("version")  # Should be as default *args and **kwargs used.
-            version_numbers = process_version.split(" ")[2]
-
-            self._version_info = cast(
-                Tuple[int, int, int, int],
-                tuple(int(n) for n in version_numbers.split(".")[:4] if n.isdigit()),
-            )
-        else:
-            super()._set_cache_(attr)
-        # END handle version info
-
     @property
     def working_dir(self) -> Union[None, PathLike]:
         """:return: Git directory we are working on"""
         return self._working_dir
 
     @property
-    def version_info(self) -> Tuple[int, int, int, int]:
+    def version_info(self) -> Tuple[int, ...]:
         """
-        :return: tuple(int, int, int, int) tuple with integers representing the major, minor
-            and additional version numbers as parsed from git version.
+        :return:  tuple with integers representing the major, minor and additional
+            version numbers as parsed from git version. Up to four fields are used.
 
             This value is generated on demand and is cached.
         """
+        # Refreshing is global, but version_info caching is per-instance.
+        refresh_token = self._refresh_token  # Copy token in case of concurrent refresh.
+
+        # Use the cached version if obtained after the most recent refresh.
+        if self._version_info_token is refresh_token:
+            assert self._version_info is not None, "Bug: corrupted token-check state"
+            return self._version_info
+
+        # Run "git version" and parse it.
+        process_version = self._call_process("version")
+        version_string = process_version.split(" ")[2]
+        version_fields = version_string.split(".")[:4]
+        leading_numeric_fields = itertools.takewhile(str.isdigit, version_fields)
+        self._version_info = tuple(map(int, leading_numeric_fields))
+
+        # This value will be considered valid until the next refresh.
+        self._version_info_token = refresh_token
         return self._version_info
 
     @overload
@@ -902,7 +1025,15 @@ class Git(LazyMixin):
 
         :param shell:
             Whether to invoke commands through a shell (see `Popen(..., shell=True)`).
-            It overrides :attr:`USE_SHELL` if it is not `None`.
+            If this is not `None`, it overrides :attr:`USE_SHELL`.
+
+            Passing ``shell=True`` to this or any other GitPython function should be
+            avoided, as it is unsafe under most circumstances. This is because it is
+            typically not feasible to fully consider and account for the effect of shell
+            expansions, especially when passing ``shell=True`` to other methods that
+            forward it to :meth:`Git.execute`. Passing ``shell=True`` is also no longer
+            needed (nor useful) to work around any known operating system specific
+            issues.
 
         :param env:
             A dictionary of environment variables to be passed to :class:`subprocess.Popen`.
@@ -940,7 +1071,7 @@ class Git(LazyMixin):
         # Remove password for the command if present.
         redacted_command = remove_password_if_present(command)
         if self.GIT_PYTHON_TRACE and (self.GIT_PYTHON_TRACE != "full" or as_process):
-            log.info(" ".join(redacted_command))
+            _logger.info(" ".join(redacted_command))
 
         # Allow the user to have the command executed in their working dir.
         try:
@@ -970,17 +1101,14 @@ class Git(LazyMixin):
                     redacted_command,
                     '"kill_after_timeout" feature is not supported on Windows.',
                 )
-            # Only search PATH, not CWD. This must be in the *caller* environment. The "1" can be any value.
-            maybe_patch_caller_env = patch_env("NoDefaultCurrentDirectoryInExePath", "1")
         else:
             cmd_not_found_exception = FileNotFoundError
-            maybe_patch_caller_env = contextlib.nullcontext()
         # END handle
 
         stdout_sink = PIPE if with_stdout else getattr(subprocess, "DEVNULL", None) or open(os.devnull, "wb")
         if shell is None:
             shell = self.USE_SHELL
-        log.debug(
+        _logger.debug(
             "Popen(%s, cwd=%s, stdin=%s, shell=%s, universal_newlines=%s)",
             redacted_command,
             cwd,
@@ -989,20 +1117,18 @@ class Git(LazyMixin):
             universal_newlines,
         )
         try:
-            with maybe_patch_caller_env:
-                proc = Popen(
-                    command,
-                    env=env,
-                    cwd=cwd,
-                    bufsize=-1,
-                    stdin=(istream or DEVNULL),
-                    stderr=PIPE,
-                    stdout=stdout_sink,
-                    shell=shell,
-                    universal_newlines=universal_newlines,
-                    creationflags=PROC_CREATIONFLAGS,
-                    **subprocess_kwargs,
-                )
+            proc = safer_popen(
+                command,
+                env=env,
+                cwd=cwd,
+                bufsize=-1,
+                stdin=(istream or DEVNULL),
+                stderr=PIPE,
+                stdout=stdout_sink,
+                shell=shell,
+                universal_newlines=universal_newlines,
+                **subprocess_kwargs,
+            )
         except cmd_not_found_exception as err:
             raise GitCommandNotFound(redacted_command, err) from err
         else:
@@ -1094,7 +1220,7 @@ class Git(LazyMixin):
             # END as_text
 
             if stderr_value:
-                log.info(
+                _logger.info(
                     "%s -> %d; stdout: '%s'; stderr: '%s'",
                     cmdstr,
                     status,
@@ -1102,9 +1228,9 @@ class Git(LazyMixin):
                     safe_decode(stderr_value),
                 )
             elif stdout_value:
-                log.info("%s -> %d; stdout: '%s'", cmdstr, status, as_text(stdout_value))
+                _logger.info("%s -> %d; stdout: '%s'", cmdstr, status, as_text(stdout_value))
             else:
-                log.info("%s -> %d", cmdstr, status)
+                _logger.info("%s -> %d", cmdstr, status)
         # END handle debug printing
 
         if with_exceptions and status != 0:

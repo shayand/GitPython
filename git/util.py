@@ -104,7 +104,7 @@ __all__ = [
     "HIDE_WINDOWS_KNOWN_ERRORS",
 ]
 
-log = logging.getLogger(__name__)
+_logger = logging.getLogger(__name__)
 
 
 def _read_win_env_flag(name: str, default: bool) -> bool:
@@ -124,7 +124,7 @@ def _read_win_env_flag(name: str, default: bool) -> bool:
     except KeyError:
         return default
 
-    log.warning(
+    _logger.warning(
         "The %s environment variable is deprecated. Its effect has never been documented and changes without warning.",
         name,
     )
@@ -135,7 +135,7 @@ def _read_win_env_flag(name: str, default: bool) -> bool:
         return False
     if adjusted_value in {"1", "true", "yes"}:
         return True
-    log.warning("%s has unrecognized value %r, treating as %r.", name, value, default)
+    _logger.warning("%s has unrecognized value %r, treating as %r.", name, value, default)
     return default
 
 
@@ -327,6 +327,17 @@ def _get_exe_extensions() -> Sequence[str]:
 
 
 def py_where(program: str, path: Optional[PathLike] = None) -> List[str]:
+    """Perform a path search to assist :func:`is_cygwin_git`.
+
+    This is not robust for general use. It is an implementation detail of
+    :func:`is_cygwin_git`. When a search following all shell rules is needed,
+    :func:`shutil.which` can be used instead.
+
+    :note: Neither this function nor :func:`shutil.which` will predict the effect of an
+        executable search on a native Windows system due to a :class:`subprocess.Popen`
+        call without ``shell=True``, because shell and non-shell executable search on
+        Windows differ considerably.
+    """
     # From: http://stackoverflow.com/a/377028/548792
     winprog_exts = _get_exe_extensions()
 
@@ -455,7 +466,7 @@ def is_cygwin_git(git_executable: Union[None, PathLike]) -> bool:
             # retcode = process.poll()
             is_cygwin = "CYGWIN" in uname_out
         except Exception as ex:
-            log.debug("Failed checking if running in CYGWIN due to: %r", ex)
+            _logger.debug("Failed checking if running in CYGWIN due to: %r", ex)
         _is_cygwin_cache[git_executable] = is_cygwin
 
     return is_cygwin
@@ -557,8 +568,8 @@ class RemoteProgress:
         "_cur_line",
         "_seen_ops",
         "error_lines",  # Lines that started with 'error:' or 'fatal:'.
-        "other_lines",
-    )  # Lines not denoting progress (i.e.g. push-infos).
+        "other_lines",  # Lines not denoting progress (i.e.g. push-infos).
+    )
     re_op_absolute = re.compile(r"(remote: )?([\w\s]+):\s+()(\d+)()(.*)")
     re_op_relative = re.compile(r"(remote: )?([\w\s]+):\s+(\d+)% \((\d+)/(\d+)\)(.*)")
 
@@ -1182,57 +1193,6 @@ class IterableList(List[T_IterableObj]):
         list.__delitem__(self, delindex)
 
 
-class IterableClassWatcher(type):
-    """Metaclass that watches."""
-
-    def __init__(cls, name: str, bases: Tuple, clsdict: Dict) -> None:
-        for base in bases:
-            if type(base) is IterableClassWatcher:
-                warnings.warn(
-                    f"GitPython Iterable subclassed by {name}. "
-                    "Iterable is deprecated due to naming clash since v3.1.18"
-                    " and will be removed in 3.1.20, "
-                    "Use IterableObj instead \n",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-
-
-class Iterable(metaclass=IterableClassWatcher):
-    """Defines an interface for iterable items, so there is a uniform way to retrieve
-    and iterate items within the git repository."""
-
-    __slots__ = ()
-
-    _id_attribute_ = "attribute that most suitably identifies your instance"
-
-    @classmethod
-    def list_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> Any:
-        """
-        Deprecated, use IterableObj instead.
-
-        Find all items of this type - subclasses can specify args and kwargs differently.
-        If no args are given, subclasses are obliged to return all items if no additional
-        arguments arg given.
-
-        :note: Favor the iter_items method as it will
-
-        :return: list(Item,...) list of item instances
-        """
-        out_list: Any = IterableList(cls._id_attribute_)
-        out_list.extend(cls.iter_items(repo, *args, **kwargs))
-        return out_list
-
-    @classmethod
-    def iter_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> Any:
-        # return typed to be compatible with subtypes e.g. Remote
-        """For more information about the arguments, see list_items.
-
-        :return: Iterator yielding Items
-        """
-        raise NotImplementedError("To be implemented by Subclass")
-
-
 @runtime_checkable
 class IterableObj(Protocol):
     """Defines an interface for iterable items, so there is a uniform way to retrieve
@@ -1246,13 +1206,28 @@ class IterableObj(Protocol):
     _id_attribute_: str
 
     @classmethod
-    def list_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> IterableList[T_IterableObj]:
-        """
-        Find all items of this type - subclasses can specify args and kwargs differently.
-        If no args are given, subclasses are obliged to return all items if no additional
-        arguments arg given.
+    @abstractmethod
+    def iter_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> Iterator[T_IterableObj]:
+        # Return-typed to be compatible with subtypes e.g. Remote.
+        """Find (all) items of this type.
 
-        :note: Favor the iter_items method as it will
+        Subclasses can specify ``args`` and ``kwargs`` differently, and may use them for
+        filtering. However, when the method is called with no additional positional or
+        keyword arguments, subclasses are obliged to to yield all items.
+
+        :return: Iterator yielding Items
+        """
+        raise NotImplementedError("To be implemented by Subclass")
+
+    @classmethod
+    def list_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> IterableList[T_IterableObj]:
+        """Find (all) items of this type and collect them into a list.
+
+        For more information about the arguments, see :meth:`iter_items`.
+
+        :note: Favor the :meth:`iter_items` method as it will avoid eagerly collecting
+            all items. When there are many items, that can slow performance and increase
+            memory usage.
 
         :return: list(Item,...) list of item instances
         """
@@ -1260,20 +1235,60 @@ class IterableObj(Protocol):
         out_list.extend(cls.iter_items(repo, *args, **kwargs))
         return out_list
 
+
+class IterableClassWatcher(type):
+    """Metaclass that issues :class:`DeprecationWarning` when :class:`git.util.Iterable`
+    is subclassed."""
+
+    def __init__(cls, name: str, bases: Tuple, clsdict: Dict) -> None:
+        for base in bases:
+            if type(base) is IterableClassWatcher:
+                warnings.warn(
+                    f"GitPython Iterable subclassed by {name}."
+                    " Iterable is deprecated due to naming clash since v3.1.18"
+                    " and will be removed in 4.0.0."
+                    " Use IterableObj instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+
+class Iterable(metaclass=IterableClassWatcher):
+    """Deprecated, use :class:`IterableObj` instead.
+
+    Defines an interface for iterable items, so there is a uniform way to retrieve
+    and iterate items within the git repository.
+    """
+
+    __slots__ = ()
+
+    _id_attribute_ = "attribute that most suitably identifies your instance"
+
     @classmethod
-    @abstractmethod
-    def iter_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> Iterator[T_IterableObj]:  # Iterator[T_IterableObj]:
-        # Return-typed to be compatible with subtypes e.g. Remote.
-        """For more information about the arguments, see list_items.
+    def iter_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> Any:
+        """Deprecated, use :class:`IterableObj` instead.
+
+        Find (all) items of this type.
+
+        See :meth:`IterableObj.iter_items` for details on usage.
 
         :return: Iterator yielding Items
         """
         raise NotImplementedError("To be implemented by Subclass")
 
+    @classmethod
+    def list_items(cls, repo: "Repo", *args: Any, **kwargs: Any) -> Any:
+        """Deprecated, use :class:`IterableObj` instead.
+
+        Find (all) items of this type and collect them into a list.
+
+        See :meth:`IterableObj.list_items` for details on usage.
+
+        :return: list(Item,...) list of item instances
+        """
+        out_list: Any = IterableList(cls._id_attribute_)
+        out_list.extend(cls.iter_items(repo, *args, **kwargs))
+        return out_list
+
 
 # } END classes
-
-
-class NullHandler(logging.Handler):
-    def emit(self, record: object) -> None:
-        pass
